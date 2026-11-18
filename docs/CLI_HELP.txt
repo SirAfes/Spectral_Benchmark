@@ -1,0 +1,107 @@
+usage: -c [-h] [--config CONFIG] [--image IMAGE] [--output-dir OUTPUT_DIR]
+          [--roi-xml ROI_XML] [--samples-csv SAMPLES_CSV]
+          [--label-raster LABEL_RASTER] [--class-map CLASS_MAP]
+          [--exclude-classes EXCLUDE_CLASSES] [--wavelengths WAVELENGTHS]
+          [--keep-bands KEEP_BANDS] [--drop-bands DROP_BANDS]
+          [--keep-wavelengths KEEP_WAVELENGTHS]
+          [--drop-wavelengths DROP_WAVELENGTHS] [--feature-sets FEATURE_SETS]
+          [--indices INDICES] [--index-tolerance-nm INDEX_TOLERANCE_NM]
+          [--models MODELS] [--outer-folds OUTER_FOLDS]
+          [--inner-folds INNER_FOLDS] [--bootstrap BOOTSTRAP]
+          [--pairwise-bootstrap PAIRWISE_BOOTSTRAP]
+          [--max-samples-per-class MAX_SAMPLES_PER_CLASS]
+          [--group-block-size GROUP_BLOCK_SIZE]
+          [--svm-train-cap SVM_TRAIN_CAP] [--knn-train-cap KNN_TRAIN_CAP]
+          [--n-jobs N_JOBS] [--seed SEED]
+          [--band-analysis-samples BAND_ANALYSIS_SAMPLES] [--map MAP]
+          [--map-top MAP_TOP] [--tile-size TILE_SIZE] [--write-confidence]
+
+Reusable grouped-validation benchmark for multispectral/hyperspectral
+supervised classification.
+
+options:
+  -h, --help            show this help message and exit
+  --config CONFIG       Optional JSON configuration file. (default: None)
+  --image IMAGE         Input multiband raster readable by GDAL/rasterio.
+                        (default: None)
+  --output-dir OUTPUT_DIR
+                        Output directory. (default: None)
+
+Training labels:
+  --roi-xml ROI_XML     ENVI RegionsOfInterest XML containing PixelDef
+                        coordinates. (default: None)
+  --samples-csv SAMPLES_CSV
+                        CSV with row,col,class and optional group,r,g,b
+                        columns. (default: None)
+  --label-raster LABEL_RASTER
+                        Integer one-band training label raster; 0 =
+                        unlabelled. (default: None)
+  --class-map CLASS_MAP
+                        Optional CSV for label-raster codes:
+                        code,name[,r,g,b]. (default: None)
+  --exclude-classes EXCLUDE_CLASSES
+                        Comma-separated class names to exclude from training.
+                        (default: None)
+
+Bands and feature sets:
+  --wavelengths WAVELENGTHS
+                        Comma-separated wavelength centres in nm, one per
+                        raster band. (default: None)
+  --keep-bands KEEP_BANDS
+                        Comma-separated 1-based band indices to keep.
+                        (default: None)
+  --drop-bands DROP_BANDS
+                        Comma-separated 1-based band indices to drop.
+                        (default: None)
+  --keep-wavelengths KEEP_WAVELENGTHS
+                        Comma-separated wavelengths to keep (nearest match).
+                        (default: None)
+  --drop-wavelengths DROP_WAVELENGTHS
+                        Comma-separated wavelengths to drop (nearest match).
+                        (default: None)
+  --feature-sets FEATURE_SETS
+                        Comma-separated presets: raw,mean_norm,raw_indices,mea
+                        n_norm_indices,raw_derivative,mean_norm_derivative,raw
+                        _indices_derivative,mean_norm_indices_derivative
+                        (default: None)
+  --indices INDICES     Comma-separated built-in indices:
+                        GLI,TGI,RGRI,VARI,NGRDI,BG_RATIO,GR_RATIO,NDVI.
+                        (default: None)
+  --index-tolerance-nm INDEX_TOLERANCE_NM
+
+Validation:
+  --models MODELS       Comma-separated models. Available:
+                        SVM,RF,HGB,LDA,KNN,SAM,SID,MIN_DIST,MAHALANOBIS,QDA
+                        (default: None)
+  --outer-folds OUTER_FOLDS
+  --inner-folds INNER_FOLDS
+  --bootstrap BOOTSTRAP
+                        Grouped bootstrap replicates for metric CIs. (default:
+                        None)
+  --pairwise-bootstrap PAIRWISE_BOOTSTRAP
+  --max-samples-per-class MAX_SAMPLES_PER_CLASS
+  --group-block-size GROUP_BLOCK_SIZE
+                        Spatial grouping block size in pixels. (default: None)
+  --svm-train-cap SVM_TRAIN_CAP
+                        Maximum training samples per SVM fit; 0 disables cap.
+                        (default: None)
+  --knn-train-cap KNN_TRAIN_CAP
+                        Maximum training samples per kNN fit; 0 disables cap.
+                        (default: None)
+  --n-jobs N_JOBS       Parallel jobs for inner GridSearchCV. (default: None)
+  --seed SEED
+
+Diagnostics:
+  --band-analysis-samples BAND_ANALYSIS_SAMPLES
+                        Approximate global raster pixels sampled for band
+                        diagnostics. (default: None)
+
+Optional full-raster mapping:
+  --map MAP             Comma-separated feature_set:model requests, e.g.
+                        raw:SVM,raw:SAM. No mapping is done by default.
+                        (default: None)
+  --map-top MAP_TOP     Also map the top N validation combinations. (default:
+                        None)
+  --tile-size TILE_SIZE
+  --write-confidence    Write float32 confidence raster(s); can be very large.
+                        (default: False)

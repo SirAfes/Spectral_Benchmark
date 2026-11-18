@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Outputs and data (rasters are large and often not shareable)
+results/
+data/
+*.tif
+*.tiff
+*.hdr
+*.xml
+!examples/**/*.xml
+
+# Personal configs with local paths
+*.local.json
+.env

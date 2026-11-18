@@ -1,0 +1,22 @@
+{
+  "image": "data/multiband_image.tif",
+  "roi_xml": "data/training_rois.xml",
+  "output_dir": "results/spectral_benchmark",
+  "exclude_classes": [],
+  "models": ["SVM", "RF", "HGB", "LDA", "KNN", "SAM", "SID", "MIN_DIST", "MAHALANOBIS", "QDA"],
+  "feature_sets": ["raw"],
+  "indices": ["GLI", "TGI", "RGRI", "VARI", "NGRDI", "BG_RATIO", "GR_RATIO"],
+  "outer_folds": 5,
+  "inner_folds": 3,
+  "bootstrap": 300,
+  "pairwise_bootstrap": 300,
+  "max_samples_per_class": 3000,
+  "group_block_size_px": 2048,
+  "svm_train_cap": 12000,
+  "knn_train_cap": 20000,
+  "band_analysis_samples": 100000,
+  "tile_size": 512,
+  "map_top": 0,
+  "write_confidence": false,
+  "seed": 0
+}
