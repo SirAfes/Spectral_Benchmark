@@ -56,6 +56,9 @@ import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.windows import Window
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 from scipy.special import softmax
 from sklearn.covariance import LedoitWolf
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
@@ -82,7 +85,7 @@ import matplotlib.pyplot as plt
 from matplotlib.path import Path as MplPath
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Every key read from a JSON config file. Unknown keys trigger a warning so that
 # typos (e.g. "group_block_size" instead of "group_block_size_px") are not
@@ -95,7 +98,7 @@ KNOWN_CONFIG_KEYS = frozenset(
         "band_analysis_samples", "exclude_classes", "models", "feature_sets", "indices",
         "wavelengths_nm", "keep_bands", "drop_bands", "keep_wavelengths_nm",
         "drop_wavelengths_nm", "roi_xml", "samples_csv", "label_raster", "class_map",
-        "map", "map_top", "write_confidence",
+        "map", "map_top", "write_confidence", "buffer_px", "repeats", "group_merge_px",
     }
 )
 DEFAULT_MODELS = (
@@ -159,6 +162,9 @@ class ValidationResult:
     per_class: pd.DataFrame
     confusion: np.ndarray
     confusion_norm: np.ndarray
+    # (n_repeats, n_samples) out-of-fold predictions; y_pred is repeat 1.
+    y_pred_repeats: np.ndarray | None = None
+    n_repeats: int = 1
 
 
 # -----------------------------------------------------------------------------
@@ -730,6 +736,53 @@ def assign_spatial_groups(rows: np.ndarray, cols: np.ndarray, block_size_px: int
     return np.asarray(group_ids).reshape(-1).astype(np.int64)
 
 
+def merge_groups_by_proximity(
+    groups: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    link_px: float,
+) -> np.ndarray:
+    """Merge groups that have pixels within ~``link_px`` pixels of each other.
+
+    Independent polygons or blocks that touch each other still share spatially
+    autocorrelated pixels, so putting them in different folds leaks information.
+    Groups are merged transitively (connected components). Pixels are binned
+    into cells of ``ceil(link_px)`` pixels; any two pixels closer than that are
+    in the same or in neighbouring cells, so the merge is conservative.
+    """
+    if link_px <= 0 or len(groups) == 0:
+        return groups
+    cell = max(1, int(math.ceil(link_px)))
+    cr = rows.astype(np.int64) // cell + 1
+    cc = cols.astype(np.int64) // cell + 1
+    stride = int(cc.max()) + 3
+    ukeys, cell_of_pixel = np.unique(cr * stride + cc, return_inverse=True)
+    cell_of_pixel = np.asarray(cell_of_pixel).reshape(-1)
+    n_cells = len(ukeys)
+
+    src: list[np.ndarray] = []
+    dst: list[np.ndarray] = []
+    for dr, dc in ((0, 1), (1, -1), (1, 0), (1, 1)):  # forward half of the 8-neighbourhood
+        nk = ukeys + dr * stride + dc
+        pos = np.minimum(np.searchsorted(ukeys, nk), n_cells - 1)
+        hit = ukeys[pos] == nk
+        src.append(np.flatnonzero(hit))
+        dst.append(pos[hit])
+
+    unique_groups, ginv = np.unique(groups, return_inverse=True)
+    ginv = np.asarray(ginv).reshape(-1)
+    pairs = np.unique(np.column_stack([cell_of_pixel, ginv]), axis=0)
+    src.append(pairs[:, 0])
+    dst.append(n_cells + pairs[:, 1])
+
+    s_all, d_all = np.concatenate(src), np.concatenate(dst)
+    n_nodes = n_cells + len(unique_groups)
+    graph = coo_matrix((np.ones(len(s_all), dtype=np.int32), (s_all, d_all)), shape=(n_nodes, n_nodes))
+    _, labels = connected_components(graph, directed=False)
+    _, merged = np.unique(labels[n_cells + ginv], return_inverse=True)
+    return np.asarray(merged).reshape(-1).astype(np.int64)
+
+
 def spatially_balanced_sample_indices(
     class_ids: np.ndarray,
     groups: np.ndarray,
@@ -1278,6 +1331,30 @@ def model_training_cap(model_name: str, svm_cap: int, knn_cap: int) -> int:
     return 0
 
 
+def buffer_train_indices(
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    coords: np.ndarray | None,
+    buffer_px: float,
+) -> tuple[np.ndarray, float, int]:
+    """Drop training pixels closer than ``buffer_px`` to any test pixel.
+
+    Grouping keeps whole polygons/blocks apart, but neighbouring groups are still
+    spatially autocorrelated. Excluding a buffer around the test pixels removes
+    that residual leakage. Returns ``(kept_train_idx, min_train_test_distance_px,
+    n_dropped)``; the minimum distance is a leakage diagnostic reported even when
+    no buffer is applied.
+    """
+    if coords is None or len(test_idx) == 0 or len(train_idx) == 0:
+        return train_idx, float("nan"), 0
+    dist, _ = cKDTree(coords[test_idx]).query(coords[train_idx], k=1)
+    min_dist = float(dist.min())
+    if buffer_px <= 0:
+        return train_idx, min_dist, 0
+    keep = dist > buffer_px
+    return train_idx[keep], min_dist, int((~keep).sum())
+
+
 def fit_with_grouped_tuning(
     model_name: str,
     X: np.ndarray,
@@ -1291,6 +1368,8 @@ def fit_with_grouped_tuning(
     seed: int,
     svm_cap: int,
     knn_cap: int,
+    coords: np.ndarray | None = None,
+    buffer_px: float = 0.0,
 ):
     estimator, grid = build_model(model_name, n_features, spectral_cols, seed)
     cap = model_training_cap(model_name, svm_cap, knn_cap)
@@ -1312,17 +1391,32 @@ def fit_with_grouped_tuning(
         estimator.fit(X[fit_idx], y[fit_idx])
         return estimator, params, len(fit_idx)
 
-    inner_cv = StratifiedGroupKFold(n_splits=n_inner, shuffle=True, random_state=seed + 17)
+    splitter = StratifiedGroupKFold(n_splits=n_inner, shuffle=True, random_state=seed + 17)
+    X_fit, y_fit, g_fit = X[fit_idx], y[fit_idx], groups[fit_idx]
+    if coords is not None and buffer_px > 0:
+        # Apply the same spatial buffer inside the tuning loop, otherwise tuning
+        # still rewards models that exploit neighbour leakage.
+        c_fit = coords[fit_idx]
+        cv: Any = []
+        for tr, te in splitter.split(X_fit, y_fit, g_fit):
+            tr_buf, _, _ = buffer_train_indices(tr, te, c_fit, buffer_px)
+            if np.unique(y_fit[tr_buf]).size < 2:  # buffer removed (almost) everything
+                tr_buf = tr
+            cv.append((tr_buf, te))
+        fit_kwargs: dict[str, Any] = {}
+    else:
+        cv = splitter
+        fit_kwargs = {"groups": g_fit}
     search = GridSearchCV(
         estimator,
         grid,
         scoring="f1_macro",
-        cv=inner_cv,
+        cv=cv,
         n_jobs=n_jobs,
         refit=True,
         error_score="raise",
     )
-    search.fit(X[fit_idx], y[fit_idx], groups=groups[fit_idx])
+    search.fit(X_fit, y_fit, **fit_kwargs)
     return search.best_estimator_, search.best_params_, len(fit_idx)
 
 
@@ -1361,6 +1455,13 @@ def per_class_table(
     )
 
 
+def mean_metrics(y_true: np.ndarray, preds: np.ndarray, labels: np.ndarray) -> dict[str, float]:
+    """Metrics averaged over repeats; ``preds`` has shape (n_repeats, n_samples)."""
+    preds = np.atleast_2d(preds)
+    per_repeat = [metric_summary(y_true, p, labels) for p in preds]
+    return {k: float(np.mean([m[k] for m in per_repeat])) for k in per_repeat[0]}
+
+
 def bootstrap_metric_ci(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -1371,6 +1472,7 @@ def bootstrap_metric_ci(
 ) -> dict[str, tuple[float, float]]:
     if n_boot <= 0:
         return {}
+    preds = np.atleast_2d(y_pred)  # (n_repeats, n_samples); 1-D input means one repeat
     rng = np.random.default_rng(seed)
     unique_groups = np.unique(groups)
     idx_by_group = {g: np.flatnonzero(groups == g) for g in unique_groups}
@@ -1389,7 +1491,7 @@ def bootstrap_metric_ci(
         for _ in range(n_boot):
             sampled_groups = rng.choice(unique_groups, size=len(unique_groups), replace=True)
             idx = np.concatenate([idx_by_group[g] for g in sampled_groups])
-            m = metric_summary(y_true[idx], y_pred[idx], labels)
+            m = mean_metrics(y_true[idx], preds[:, idx], labels)
             for key in records:
                 records[key].append(m[key])
     return {
@@ -1412,63 +1514,104 @@ def evaluate_model(
     seed: int,
     svm_cap: int,
     knn_cap: int,
+    coords: np.ndarray | None = None,
+    buffer_px: float = 0.0,
+    repeats: int = 1,
 ) -> ValidationResult:
+    """Spatially grouped nested cross-validation.
+
+    ``coords`` (n, 2) pixel coordinates enable the leakage diagnostic
+    (``min_train_test_dist_px``) and, with ``buffer_px > 0``, a spatial buffer:
+    training pixels closer than ``buffer_px`` to a test pixel are excluded, in
+    both the outer folds and the inner tuning folds. ``repeats > 1`` repeats the
+    whole outer split with different random fold assignments; headline metrics
+    are the mean over repeats and the bootstrap resamples groups jointly for
+    all repeats.
+    """
     labels = np.arange(len(class_names), dtype=np.int32)
     n_outer = choose_group_folds(y, groups, outer_folds, "outer")
-    outer = StratifiedGroupKFold(n_splits=n_outer, shuffle=True, random_state=seed)
+    repeats = max(1, int(repeats))
 
-    y_pred = np.full_like(y, -1)
+    preds = np.full((repeats, len(y)), -1, dtype=y.dtype)
     fold_records: list[dict[str, Any]] = []
     params_records: list[dict[str, Any]] = []
 
-    for fold, (train_idx, test_idx) in enumerate(outer.split(X, y, groups), start=1):
-        t0 = time.time()
-        absent = sorted(set(labels.tolist()) - set(np.unique(y[train_idx]).tolist()))
-        if absent:
-            warnings.warn(
-                f"{model_name}: outer fold {fold} has no training pixels for class id(s) {absent}; "
-                f"those classes cannot be predicted in this fold."
+    for rep in range(repeats):
+        outer = StratifiedGroupKFold(n_splits=n_outer, shuffle=True, random_state=seed + 1009 * rep)
+        for fold, (train_all, test_idx) in enumerate(outer.split(X, y, groups), start=1):
+            t0 = time.time()
+            train_idx, min_dist, n_dropped = buffer_train_indices(train_all, test_idx, coords, buffer_px)
+            if n_dropped:
+                frac = n_dropped / len(train_all)
+                if np.unique(y[train_idx]).size < 2 or len(train_idx) < 2 * len(labels):
+                    raise RuntimeError(
+                        f"buffer_px={buffer_px:g} removes {n_dropped} of {len(train_all)} training pixels in outer "
+                        f"fold {fold}, leaving too few to fit a model. Use a smaller buffer (it should be about the "
+                        f"spatial autocorrelation range, well below the size of your groups) or more training regions."
+                    )
+                if frac > 0.5:
+                    warnings.warn(
+                        f"{model_name}: spatial buffer removed {100 * frac:.0f}% of the training pixels in outer "
+                        f"fold {fold}; results may be pessimistic and unstable."
+                    )
+            absent = sorted(set(labels.tolist()) - set(np.unique(y[train_idx]).tolist()))
+            if absent:
+                warnings.warn(
+                    f"{model_name}: outer fold {fold} (repeat {rep + 1}) has no training pixels for class "
+                    f"id(s) {absent}; those classes cannot be predicted in this fold."
+                    + (" The spatial buffer may be too large." if n_dropped else "")
+                )
+            model, best_params, n_fit = fit_with_grouped_tuning(
+                model_name=model_name,
+                X=X,
+                y=y,
+                groups=groups,
+                train_idx=train_idx,
+                n_features=X.shape[1],
+                spectral_cols=feature_context.base_feature_count,
+                inner_folds=inner_folds,
+                n_jobs=n_jobs,
+                seed=seed + fold * 101 + rep * 100003,
+                svm_cap=svm_cap,
+                knn_cap=knn_cap,
+                coords=coords,
+                buffer_px=buffer_px,
             )
-        model, best_params, n_fit = fit_with_grouped_tuning(
-            model_name=model_name,
-            X=X,
-            y=y,
-            groups=groups,
-            train_idx=train_idx,
-            n_features=X.shape[1],
-            spectral_cols=feature_context.base_feature_count,
-            inner_folds=inner_folds,
-            n_jobs=n_jobs,
-            seed=seed + fold * 101,
-            svm_cap=svm_cap,
-            knn_cap=knn_cap,
-        )
-        pred = np.asarray(model.predict(X[test_idx]), dtype=y.dtype)
-        y_pred[test_idx] = pred
-        fm = metric_summary(y[test_idx], pred, labels)
-        fold_records.append(
-            {
-                "fold": fold,
-                "n_train": len(train_idx),
-                "n_fit_after_cap": n_fit,
-                "n_test": len(test_idx),
-                "n_train_groups": int(np.unique(groups[train_idx]).size),
-                "n_test_groups": int(np.unique(groups[test_idx]).size),
-                "seconds": time.time() - t0,
-                **fm,
-            }
-        )
-        params_records.append(best_params)
-        log(
-            f"    fold {fold}/{n_outer}: macro-F1={fm['macro_F1']:.3f}, "
-            f"OA={fm['OA']:.3f}, {time.time() - t0:.1f}s"
-        )
+            pred = np.asarray(model.predict(X[test_idx]), dtype=y.dtype)
+            preds[rep, test_idx] = pred
+            fm = metric_summary(y[test_idx], pred, labels)
+            fold_records.append(
+                {
+                    "repeat": rep + 1,
+                    "fold": fold,
+                    "n_train": len(train_idx),
+                    "n_train_before_buffer": len(train_all),
+                    "n_train_dropped_by_buffer": n_dropped,
+                    "min_train_test_dist_px": min_dist,
+                    "n_fit_after_cap": n_fit,
+                    "n_test": len(test_idx),
+                    "n_train_groups": int(np.unique(groups[train_idx]).size),
+                    "n_test_groups": int(np.unique(groups[test_idx]).size),
+                    "seconds": time.time() - t0,
+                    **fm,
+                }
+            )
+            params_records.append(best_params)
+            tag = f"repeat {rep + 1}/{repeats}, " if repeats > 1 else ""
+            log(
+                f"    {tag}fold {fold}/{n_outer}: macro-F1={fm['macro_F1']:.3f}, "
+                f"OA={fm['OA']:.3f}, {time.time() - t0:.1f}s"
+            )
 
-    if np.any(y_pred < 0):
+    if np.any(preds < 0):
         raise RuntimeError("Internal error: some samples received no out-of-fold prediction.")
 
-    summary = metric_summary(y, y_pred, labels)
-    ci = bootstrap_metric_ci(y, y_pred, groups, labels, bootstrap_reps, seed + 9001)
+    summary = mean_metrics(y, preds, labels)
+    if repeats > 1:
+        per_repeat = [metric_summary(y, preds[r], labels) for r in range(repeats)]
+        for key in summary.copy():
+            summary[f"{key}_repeat_std"] = float(np.std([m[key] for m in per_repeat], ddof=1))
+    ci = bootstrap_metric_ci(y, preds, groups, labels, bootstrap_reps, seed + 9001)
     for key, (lo, hi) in ci.items():
         summary[f"{key}_CI95_low"] = lo
         summary[f"{key}_CI95_high"] = hi
@@ -1477,9 +1620,15 @@ def evaluate_model(
     for key in ("OA", "balanced_accuracy", "macro_F1", "weighted_F1", "kappa", "MCC"):
         summary[f"{key}_fold_mean"] = float(fold_df[key].mean())
         summary[f"{key}_fold_std"] = float(fold_df[key].std(ddof=1)) if len(fold_df) > 1 else 0.0
+    summary["min_train_test_dist_px"] = float(fold_df["min_train_test_dist_px"].min())
+    summary["n_repeats"] = repeats
 
-    per_class = per_class_table(y, y_pred, class_names)
-    cm = confusion_matrix(y, y_pred, labels=labels)
+    tables = [per_class_table(y, preds[r], class_names) for r in range(repeats)]
+    per_class = tables[0].copy()
+    for col in ("precision_UA", "recall_PA", "F1", "support"):
+        per_class[col] = np.mean([t[col].to_numpy() for t in tables], axis=0)
+    cms = [confusion_matrix(y, preds[r], labels=labels) for r in range(repeats)]
+    cm = cms[0] if repeats == 1 else np.mean(cms, axis=0)
     row_sum = cm.sum(axis=1, keepdims=True)
     cm_norm = np.divide(cm, row_sum, out=np.zeros_like(cm, dtype=float), where=row_sum > 0)
 
@@ -1487,7 +1636,7 @@ def evaluate_model(
         feature_set=feature_context.spec.name,
         model=model_name,
         y_true=y.copy(),
-        y_pred=y_pred,
+        y_pred=preds[0].copy(),
         groups=groups.copy(),
         fold_metrics=fold_records,
         best_params_per_fold=params_records,
@@ -1495,6 +1644,8 @@ def evaluate_model(
         per_class=per_class,
         confusion=cm,
         confusion_norm=cm_norm,
+        y_pred_repeats=preds,
+        n_repeats=repeats,
     )
 
 
@@ -1811,22 +1962,66 @@ def save_per_class_f1_heatmap(per_class_all: pd.DataFrame, figures_dir: Path) ->
     plt.close(fig)
 
 
+def holm_adjust(p_values: Sequence[float]) -> np.ndarray:
+    """Holm-Bonferroni step-down adjustment (controls family-wise error)."""
+    p = np.asarray(p_values, dtype=float)
+    out = np.full(p.shape, np.nan)
+    valid = np.flatnonzero(np.isfinite(p))
+    if valid.size == 0:
+        return out
+    order = valid[np.argsort(p[valid])]
+    running = 0.0
+    m = valid.size
+    for rank, i in enumerate(order):
+        running = max(running, (m - rank) * p[i])
+        out[i] = min(1.0, running)
+    return out
+
+
+def bootstrap_p_value(boot_deltas: Sequence[float]) -> float:
+    """Two-sided p-value for H0: delta = 0 from a bootstrap distribution of the delta.
+
+    Uses the share of replicates on the opposite side of zero (with a +1
+    correction so p is never exactly 0). It is approximate and its resolution is
+    limited by the number of replicates (about 2/(B+1)).
+    """
+    b = np.asarray(boot_deltas, dtype=float)
+    b = b[np.isfinite(b)]
+    if b.size == 0:
+        return float("nan")
+    tail = min(int(np.sum(b <= 0)), int(np.sum(b >= 0)))
+    return float(min(1.0, 2.0 * (tail + 1) / (b.size + 1)))
+
+
 def pairwise_bootstrap_comparisons(
     results: Sequence[ValidationResult],
     n_boot: int,
     seed: int,
 ) -> pd.DataFrame:
+    """Paired grouped-bootstrap differences between models within each feature set.
+
+    Both models are scored on the *same* resampled groups, so the interval
+    reflects the paired difference. The Holm-adjusted p-values account for the
+    number of model pairs compared within a feature set; unadjusted intervals
+    across many pairs will show some spurious "differences" by chance.
+    """
     rows: list[dict[str, Any]] = []
     by_feature: dict[str, list[ValidationResult]] = {}
     for r in results:
         by_feature.setdefault(r.feature_set, []).append(r)
 
+    def repeats_of(res: ValidationResult) -> np.ndarray:
+        return res.y_pred_repeats if res.y_pred_repeats is not None else np.atleast_2d(res.y_pred)
+
     rng = np.random.default_rng(seed)
     for feature_set, feature_results in by_feature.items():
+        feature_rows: list[dict[str, Any]] = []
         for a, b in itertools.combinations(feature_results, 2):
+            pa, pb = repeats_of(a), repeats_of(b)
             if not (
                 np.array_equal(a.y_true, b.y_true)
                 and np.array_equal(a.groups, b.groups)
+                and pa.shape == pb.shape
             ):
                 continue
             y = a.y_true
@@ -1834,8 +2029,8 @@ def pairwise_bootstrap_comparisons(
             labels = np.unique(y)
             unique_groups = np.unique(groups)
             idx_by_group = {g: np.flatnonzero(groups == g) for g in unique_groups}
-            actual_a = metric_summary(y, a.y_pred, labels)
-            actual_b = metric_summary(y, b.y_pred, labels)
+            actual_a = mean_metrics(y, pa, labels)
+            actual_b = mean_metrics(y, pb, labels)
 
             boot_oa: list[float] = []
             boot_f1: list[float] = []
@@ -1844,8 +2039,8 @@ def pairwise_bootstrap_comparisons(
                 for _ in range(max(0, n_boot)):
                     sampled = rng.choice(unique_groups, len(unique_groups), replace=True)
                     idx = np.concatenate([idx_by_group[g] for g in sampled])
-                    ma = metric_summary(y[idx], a.y_pred[idx], labels)
-                    mb = metric_summary(y[idx], b.y_pred[idx], labels)
+                    ma = mean_metrics(y[idx], pa[:, idx], labels)
+                    mb = mean_metrics(y[idx], pb[:, idx], labels)
                     boot_oa.append(ma["OA"] - mb["OA"])
                     boot_f1.append(ma["macro_F1"] - mb["macro_F1"])
 
@@ -1856,7 +2051,7 @@ def pairwise_bootstrap_comparisons(
 
             oa_lo, oa_hi = ci(boot_oa)
             f1_lo, f1_hi = ci(boot_f1)
-            rows.append(
+            feature_rows.append(
                 {
                     "feature_set": feature_set,
                     "model_A": a.model,
@@ -1864,11 +2059,18 @@ def pairwise_bootstrap_comparisons(
                     "delta_OA_A_minus_B": actual_a["OA"] - actual_b["OA"],
                     "delta_OA_CI95_low": oa_lo,
                     "delta_OA_CI95_high": oa_hi,
+                    "delta_OA_p_boot": bootstrap_p_value(boot_oa),
                     "delta_macro_F1_A_minus_B": actual_a["macro_F1"] - actual_b["macro_F1"],
                     "delta_macro_F1_CI95_low": f1_lo,
                     "delta_macro_F1_CI95_high": f1_hi,
+                    "delta_macro_F1_p_boot": bootstrap_p_value(boot_f1),
                 }
             )
+        for key in ("delta_OA", "delta_macro_F1"):
+            adjusted = holm_adjust([r[f"{key}_p_boot"] for r in feature_rows])
+            for r, p_adj in zip(feature_rows, adjusted):
+                r[f"{key}_p_holm"] = float(p_adj)
+        rows.extend(feature_rows)
     return pd.DataFrame(rows)
 
 
@@ -1888,6 +2090,8 @@ def fit_final_model(
     seed: int,
     svm_cap: int,
     knn_cap: int,
+    coords: np.ndarray | None = None,
+    buffer_px: float = 0.0,
 ):
     idx = np.arange(len(y))
     model, params, n_fit = fit_with_grouped_tuning(
@@ -1903,6 +2107,8 @@ def fit_final_model(
         seed=seed + 4444,
         svm_cap=svm_cap,
         knn_cap=knn_cap,
+        coords=coords,
+        buffer_px=buffer_px,
     )
     return model, params, n_fit
 
@@ -2151,6 +2357,11 @@ def run(args: argparse.Namespace) -> int:
     tile_size = int(config_value(args.tile_size, config, "tile_size", 512))
     index_tolerance_nm = float(config_value(args.index_tolerance_nm, config, "index_tolerance_nm", 60.0))
     global_band_samples = int(config_value(args.band_analysis_samples, config, "band_analysis_samples", 100000))
+    buffer_px = float(config_value(args.buffer_px, config, "buffer_px", 0.0))
+    repeats = int(config_value(args.repeats, config, "repeats", 1))
+    group_merge_px = float(config_value(args.group_merge_px, config, "group_merge_px", 0.0))
+    if buffer_px < 0 or group_merge_px < 0 or repeats < 1:
+        raise ValueError("buffer_px and group_merge_px must be >= 0 and repeats must be >= 1.")
 
     exclude_classes = set(parse_csv_list(args.exclude_classes))
     if not exclude_classes:
@@ -2241,11 +2452,20 @@ def run(args: argparse.Namespace) -> int:
                 offset = int(groups_all[~unmatched].max() + 1) if np.any(~unmatched) else 0
                 groups_all[unmatched] = fallback + offset
                 group_source = "ENVI_GeometryDef_polygons_plus_spatial_fallback"
+            elif label_source["type"] == "samples_csv":
+                group_source = "csv_group_column"
             else:
                 group_source = "ENVI_GeometryDef_polygons"
         else:
             groups_all = assign_spatial_groups(labels.rows, labels.cols, group_block_size)
             group_source = f"spatial_blocks_{group_block_size}px"
+
+        if group_merge_px > 0:
+            n_before = int(np.unique(groups_all).size)
+            groups_all = merge_groups_by_proximity(groups_all, labels.rows, labels.cols, group_merge_px)
+            n_after = int(np.unique(groups_all).size)
+            group_source += f"+merged_within_{group_merge_px:g}px"
+            log(f"Merged spatially adjacent groups (<= {group_merge_px:g} px): {n_before} -> {n_after}")
 
         sample_idx = spatially_balanced_sample_indices(
             labels.class_ids,
@@ -2280,6 +2500,8 @@ def run(args: argparse.Namespace) -> int:
         if len(np.unique(y)) != len(labels.class_names):
             missing_names = [labels.class_names[c] for c in range(len(labels.class_names)) if not np.any(y == c)]
             raise RuntimeError(f"Some classes have no valid sampled pixels after raster masking: {missing_names}")
+
+        coords = np.column_stack([rows, cols]).astype(np.float64)
 
         sample_manifest = pd.DataFrame(
             {
@@ -2363,6 +2585,9 @@ def run(args: argparse.Namespace) -> int:
                     seed=seed,
                     svm_cap=svm_cap,
                     knn_cap=knn_cap,
+                    coords=coords,
+                    buffer_px=buffer_px,
+                    repeats=repeats,
                 )
             except Exception as exc:
                 if os.environ.get("SPECTRAL_BENCHMARK_DEBUG") == "1":
@@ -2396,7 +2621,7 @@ def run(args: argparse.Namespace) -> int:
                     for i, params in enumerate(result.best_params_per_fold)
                 ]
             ).to_csv(tables_dir / f"best_params_{base}.csv", index=False)
-            pd.DataFrame(
+            oof = pd.DataFrame(
                 {
                     "row": rows,
                     "col": cols,
@@ -2406,7 +2631,11 @@ def run(args: argparse.Namespace) -> int:
                     "predicted_id": result.y_pred,
                     "predicted_class": [labels.class_names[c] for c in result.y_pred],
                 }
-            ).to_csv(tables_dir / f"oof_predictions_{base}.csv", index=False)
+            )
+            if result.y_pred_repeats is not None:
+                for r_i in range(1, result.n_repeats):
+                    oof[f"predicted_id_repeat{r_i + 1}"] = result.y_pred_repeats[r_i]
+            oof.to_csv(tables_dir / f"oof_predictions_{base}.csv", index=False)
             save_confusion_figure(
                 result.confusion_norm,
                 labels.class_names,
@@ -2497,6 +2726,8 @@ def run(args: argparse.Namespace) -> int:
             seed,
             svm_cap,
             knn_cap,
+            coords=coords,
+            buffer_px=buffer_px,
         )
         write_confidence = bool(args.write_confidence or config.get("write_confidence", False))
         class_path, conf_path = map_full_raster(
@@ -2544,6 +2775,10 @@ def run(args: argparse.Namespace) -> int:
         "inner_folds_requested": inner_folds,
         "bootstrap_reps": bootstrap_reps,
         "pairwise_bootstrap_reps": pairwise_bootstrap_reps,
+        "buffer_px": buffer_px,
+        "repeats": repeats,
+        "group_merge_px": group_merge_px,
+        "n_groups": int(np.unique(groups).size),
         "seed": seed,
         "n_jobs": n_jobs,
         "svm_train_cap": svm_cap,
@@ -2650,6 +2885,24 @@ def build_parser() -> argparse.ArgumentParser:
     validation.add_argument("--knn-train-cap", type=int, default=None, help="Maximum training samples per kNN fit; 0 disables cap.")
     validation.add_argument("--n-jobs", type=int, default=None, help="Parallel jobs for inner GridSearchCV.")
     validation.add_argument("--seed", type=int, default=None)
+    validation.add_argument(
+        "--buffer-px",
+        type=float,
+        default=None,
+        help="Exclude training pixels closer than this many pixels to any test pixel (outer and inner folds). 0 = off.",
+    )
+    validation.add_argument(
+        "--group-merge-px",
+        type=float,
+        default=None,
+        help="Merge groups (polygons/blocks) that have pixels within this many pixels of each other. 0 = off.",
+    )
+    validation.add_argument(
+        "--repeats",
+        type=int,
+        default=None,
+        help="Repeat the outer grouped CV with different fold assignments and average (1 = single run).",
+    )
 
     diagnostics = p.add_argument_group("Diagnostics")
     diagnostics.add_argument("--band-analysis-samples", type=int, default=None, help="Approximate global raster pixels sampled for band diagnostics.")

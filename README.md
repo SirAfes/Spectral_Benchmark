@@ -180,6 +180,18 @@ For a compact scientific comparison, use:
 
 Kappa and MCC are also generated but do not need to be the main story unless required by the venue.
 
+## Controlling spatial leakage
+
+Grouped folds stop a polygon from being split between train and test, but *neighbouring* groups are still correlated. Three options address this (all off by default; see [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) for how to choose values):
+
+| Option (config key) | Purpose |
+|---|---|
+| `--group-merge-px N` (`group_merge_px`) | Merge groups that have pixels within about N px of each other. |
+| `--buffer-px N` (`buffer_px`) | Exclude training pixels within N px of any test pixel, in the outer and inner folds. |
+| `--repeats R` (`repeats`) | Repeat the outer grouped CV with different fold assignments and average. |
+
+Every run reports `min_train_test_dist_px` (smallest train-to-test distance per fold) so you can see whether neighbour leakage is possible. Pairwise model comparisons include Holm-adjusted p-values (`*_p_holm`) because ten models mean 45 comparisons per feature set.
+
 ## Spatial groups
 
 For CSV labels, provide a `group` column when you already know the independent polygons/sites/sampling units. This is the preferred option.
@@ -193,6 +205,8 @@ If a class occurs in too few independent groups, the script reduces the number o
 RBF SVM fit time grows rapidly with sample count. The framework therefore supports `--svm-train-cap` while keeping the full sampled test folds for evaluation. The default is 12,000 fit samples. Increase it only when runtime and memory allow it.
 
 ## Limitations to keep in mind
+
+(Details and recommended settings: [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md).)
 
 - **Optimistic by construction.** Training ROIs are usually drawn on clearly identifiable, homogeneous patches. Grouped validation removes neighbour leakage *between* ROIs, but accuracy on ROI pixels will still overstate accuracy over the whole scene, especially for mixed or transitional pixels. Validate a final map against independently collected reference points when you can.
 - **Class-balanced sampling.** `--max-samples-per-class` caps every class, so Overall Accuracy is computed on a roughly class-balanced sample, not on the true area proportions of the scene. Prefer Macro-F1 / per-class metrics, or area-weight the confusion matrix before quoting an area-based OA.

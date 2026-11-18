@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0
+
+### Added
+- `--buffer-px`: spatial buffer that removes training pixels near test pixels (outer and inner folds), plus an always-on `min_train_test_dist_px` leakage diagnostic.
+- `--group-merge-px`: merges polygons/blocks that touch or lie within N pixels, so adjacent groups cannot straddle train and test.
+- `--repeats`: repeated grouped CV; headline metrics are averaged over repeats, bootstrap CIs resample groups jointly.
+- Bootstrap p-values and Holm-adjusted p-values in `pairwise_model_comparisons.csv`.
+- `docs/METHODOLOGY.md`: what the protocol guarantees, remaining biases, how to choose the spatial options.
+- Clear error / warning when a buffer removes too many training pixels.
+
+### Fixed
+- `group_source` in the manifest said "ENVI polygons" for CSV group columns.
+
+### Notes
+- Defaults are unchanged, so v1.1 results are reproduced exactly unless the new options are used (the fold table gains extra columns).
+
 ## 1.1.0
 
 ### Fixed

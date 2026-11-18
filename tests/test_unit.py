@@ -362,3 +362,175 @@ def test_feature_specs_from_inputs_cli_overrides_config():
     assert specs[1].indices == ["GLI"]
     specs = sb.feature_specs_from_inputs(None, None, {"feature_sets": [{"name": "x", "derivative": True}]})
     assert specs[0].derivative and specs[0].name == "x"
+
+
+# --------------------------------------------------------------------------- spatial methods
+
+
+def _ctx(bands: int = 5) -> "sb.FeatureContext":
+    names = [f"b{i}" for i in range(bands)]
+    return sb.FeatureContext(np.arange(bands), names, None, bands, names, sb.feature_preset("raw", []), [])
+
+
+def test_merge_groups_by_proximity():
+    # A: rows 0-9, B: rows 10-19 (touching A), D: rows 20-29 (touching B), C: far away.
+    rows = np.r_[np.arange(0, 10), np.arange(10, 20), np.arange(20, 30), [500, 501]]
+    cols = np.zeros_like(rows)
+    groups = np.r_[np.zeros(10), np.ones(10), np.full(10, 2), [3, 3]].astype(np.int64)
+    merged = sb.merge_groups_by_proximity(groups, rows, cols, link_px=2)
+    assert merged.ndim == 1 and merged.dtype == np.int64
+    assert len(np.unique(merged[:30])) == 1, "touching groups must merge transitively"
+    assert merged[30] != merged[0] and merged[30] == merged[31]
+    # Gap of 5 px: not linked at 2 px, linked at 6 px.
+    rows2 = np.r_[np.arange(0, 5), np.arange(10, 15)]
+    g2 = np.r_[np.zeros(5), np.ones(5)].astype(np.int64)
+    cols2 = np.zeros_like(rows2)
+    assert len(np.unique(sb.merge_groups_by_proximity(g2, rows2, cols2, 2))) == 2
+    assert len(np.unique(sb.merge_groups_by_proximity(g2, rows2, cols2, 6))) == 1
+    # Off by default.
+    assert np.array_equal(sb.merge_groups_by_proximity(groups, rows, cols, 0), groups)
+
+
+def test_merge_groups_diagonal_neighbours_and_never_splits():
+    rows = np.array([0, 1, 40, 41])
+    cols = np.array([0, 1, 40, 41])
+    groups = np.array([0, 1, 2, 3])
+    merged = sb.merge_groups_by_proximity(groups, rows, cols, 3)
+    assert merged[0] == merged[1] and merged[2] == merged[3] and merged[0] != merged[2]
+    # Merging can only coarsen: pixels sharing a group before still share it after.
+    rng = np.random.default_rng(0)
+    r, c = rng.integers(0, 200, 300), rng.integers(0, 200, 300)
+    g = (r // 50) * 4 + c // 50
+    m = sb.merge_groups_by_proximity(g, r, c, 5)
+    for gid in np.unique(g):
+        assert len(np.unique(m[g == gid])) == 1
+
+
+def test_buffer_train_indices():
+    coords = np.column_stack([np.arange(10.0), np.zeros(10)])
+    train, test = np.array([0, 1, 2, 3, 4, 5, 6]), np.array([7, 8, 9])
+    kept, min_d, dropped = sb.buffer_train_indices(train, test, coords, buffer_px=2.0)
+    assert min_d == 1.0 and dropped == 2 and kept.tolist() == [0, 1, 2, 3, 4]  # 5, 6 are within 2 px of 7
+    kept, min_d, dropped = sb.buffer_train_indices(train, test, coords, buffer_px=0)
+    assert dropped == 0 and len(kept) == 7 and min_d == 1.0
+    assert sb.buffer_train_indices(train, test, None, 5.0)[0].tolist() == train.tolist()
+
+
+def test_holm_adjust_and_bootstrap_p():
+    adj = sb.holm_adjust([0.01, 0.04, 0.03])
+    assert np.allclose(adj, [0.03, 0.06, 0.06])
+    assert np.allclose(sb.holm_adjust([0.5, 0.9]), [1.0, 1.0])
+    assert np.isnan(sb.holm_adjust([np.nan])[0])
+    rng = np.random.default_rng(0)
+    assert sb.bootstrap_p_value(rng.normal(0, 1, 2000)) > 0.5
+    assert sb.bootstrap_p_value(np.full(199, 0.3)) == pytest.approx(2 * 1 / 200)
+    assert np.isnan(sb.bootstrap_p_value([]))
+
+
+def test_evaluate_model_repeats_and_diagnostics():
+    X, y, groups = _grouped_problem()
+    rng = np.random.default_rng(0)
+    coords = rng.uniform(0, 100, (len(y), 2))
+    res = sb.evaluate_model(
+        X, y, groups, ["A", "B", "C"], _ctx(), "MIN_DIST", 3, 2, 10, 1, 0, 0, 0,
+        coords=coords, buffer_px=0.0, repeats=3,
+    )
+    assert res.n_repeats == 3 and res.y_pred_repeats.shape == (3, len(y))
+    assert len(res.fold_metrics) == 9 and {f["repeat"] for f in res.fold_metrics} == {1, 2, 3}
+    assert "OA_repeat_std" in res.summary and res.summary["min_train_test_dist_px"] >= 0
+    assert np.array_equal(res.y_pred, res.y_pred_repeats[0])
+    # Different repeats use different fold assignments.
+    assert not np.array_equal(res.y_pred_repeats[0], res.y_pred_repeats[1]) or res.summary["OA"] == 1.0
+
+
+def test_single_repeat_matches_previous_behaviour():
+    """repeats=1 must be the plain nested CV: same folds as repeats=3's first repeat."""
+    X, y, groups = _grouped_problem()
+    a = sb.evaluate_model(X, y, groups, ["A", "B", "C"], _ctx(), "SAM", 3, 2, 0, 1, 7, 0, 0)
+    b = sb.evaluate_model(X, y, groups, ["A", "B", "C"], _ctx(), "SAM", 3, 2, 0, 1, 7, 0, 0, repeats=3)
+    assert np.array_equal(a.y_pred, b.y_pred_repeats[0])
+
+
+def test_buffer_removes_training_pixels_and_is_reported():
+    X, y, groups = _grouped_problem()
+    rng = np.random.default_rng(1)
+    coords = rng.uniform(0, 60, (len(y), 2))
+    res = sb.evaluate_model(
+        X, y, groups, ["A", "B", "C"], _ctx(), "LDA", 3, 2, 0, 1, 0, 0, 0, coords=coords, buffer_px=3.0
+    )
+    assert all(f["n_train_dropped_by_buffer"] > 0 for f in res.fold_metrics)
+    assert all(f["n_train"] == f["n_train_before_buffer"] - f["n_train_dropped_by_buffer"] for f in res.fold_metrics)
+
+
+def test_oversized_buffer_gives_a_clear_error():
+    X, y, groups = _grouped_problem()
+    coords = np.random.default_rng(2).uniform(0, 10, (len(y), 2))
+    with pytest.raises(RuntimeError, match="buffer_px"):
+        sb.evaluate_model(
+            X, y, groups, ["A", "B", "C"], _ctx(), "LDA", 3, 2, 0, 1, 0, 0, 0, coords=coords, buffer_px=50.0
+        )
+
+
+def test_pairwise_table_has_holm_adjusted_p_values():
+    X, y, groups = _grouped_problem()
+    results = [
+        sb.evaluate_model(X, y, groups, ["A", "B", "C"], _ctx(), m, 3, 2, 0, 1, 0, 0, 0, repeats=2)
+        for m in ("SAM", "MIN_DIST", "LDA")
+    ]
+    table = sb.pairwise_bootstrap_comparisons(results, 40, 0)
+    assert len(table) == 3
+    for col in ("delta_OA_p_boot", "delta_OA_p_holm", "delta_macro_F1_p_boot", "delta_macro_F1_p_holm"):
+        assert col in table and table[col].between(0, 1).all()
+    assert (table["delta_OA_p_holm"] >= table["delta_OA_p_boot"] - 1e-12).all()
+
+
+def test_new_config_keys_are_known():
+    assert {"buffer_px", "repeats", "group_merge_px"} <= sb.KNOWN_CONFIG_KEYS
+
+
+def _leaky_field(seed: int, size: int = 120, bands: int = 6, delta: float = 0.3, sigma: float = 4.0):
+    """Two classes with only a WEAK real signal plus spatially correlated noise.
+
+    Noise is smooth across neighbouring pixels, so neighbours act as near-duplicates:
+    a flexible model can 'recognise' a test pixel's neighbour in the training set.
+    """
+    ndimage = pytest.importorskip("scipy.ndimage")
+    rng = np.random.default_rng(seed)
+    noise = np.stack([ndimage.gaussian_filter(rng.normal(size=(size, size)), sigma) for _ in range(bands)])
+    noise /= noise.reshape(bands, -1).std(axis=1)[:, None, None]
+    noise += rng.normal(0, 0.2, noise.shape)
+    half = size // 2
+    cls = (np.arange(size)[:, None] >= half).astype(int) ^ (np.arange(size)[None, :] >= half).astype(int)
+    img = noise + delta * (2 * cls - 1)[None]
+    cell, per_cell = 20, 100
+    rr, cc = [], []
+    for br in range(size // cell):
+        for bc in range(size // cell):
+            rr.append(rng.integers(br * cell, (br + 1) * cell, per_cell))
+            cc.append(rng.integers(bc * cell, (bc + 1) * cell, per_cell))
+    rows, cols = np.concatenate(rr), np.concatenate(cc)
+    return (
+        img[:, rows, cols].T.astype(np.float32),
+        cls[rows, cols],
+        (rows // cell) * (size // cell) + cols // cell,
+        np.column_stack([rows, cols]).astype(float),
+    )
+
+
+def test_spatial_buffer_removes_neighbour_leakage():
+    """With grid-block groups, kNN looks better than the data allow; a buffer cures that.
+
+    Bayes-optimal accuracy for this field is about 0.64 (6 bands, delta=0.3 sigma). Without a
+    buffer, kNN exploits neighbouring training pixels and scores clearly higher.
+    """
+    acc = {0: [], 9: []}
+    for seed in range(3):
+        X, y, groups, coords = _leaky_field(seed)
+        for buf in acc:
+            res = sb.evaluate_model(
+                X, y, groups, ["A", "B"], _ctx(6), "KNN", 4, 2, 0, 1, seed, 0, 0, coords=coords, buffer_px=buf
+            )
+            acc[buf].append(res.summary["OA"])
+    unbuffered, buffered = float(np.mean(acc[0])), float(np.mean(acc[9]))
+    assert unbuffered - buffered > 0.04, (unbuffered, buffered)
+    assert buffered < 0.70  # close to the true ceiling, not inflated
