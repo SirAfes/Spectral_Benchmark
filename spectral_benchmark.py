@@ -85,7 +85,7 @@ import matplotlib.pyplot as plt
 from matplotlib.path import Path as MplPath
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Every key read from a JSON config file. Unknown keys trigger a warning so that
 # typos (e.g. "group_block_size" instead of "group_block_size_px") are not
@@ -99,6 +99,7 @@ KNOWN_CONFIG_KEYS = frozenset(
         "wavelengths_nm", "keep_bands", "drop_bands", "keep_wavelengths_nm",
         "drop_wavelengths_nm", "roi_xml", "samples_csv", "label_raster", "class_map",
         "map", "map_top", "write_confidence", "buffer_px", "repeats", "group_merge_px",
+        "class_prevalence", "holdout_fraction", "min_confidence",
     }
 )
 DEFAULT_MODELS = (
@@ -1622,6 +1623,7 @@ def evaluate_model(
         summary[f"{key}_fold_std"] = float(fold_df[key].std(ddof=1)) if len(fold_df) > 1 else 0.0
     summary["min_train_test_dist_px"] = float(fold_df["min_train_test_dist_px"].min())
     summary["n_repeats"] = repeats
+    summary["min_groups_per_class"] = min(groups_per_class(y, groups).values())
 
     tables = [per_class_table(y, preds[r], class_names) for r in range(repeats)]
     per_class = tables[0].copy()
@@ -1922,7 +1924,9 @@ def save_model_comparison_figures(comparison: pd.DataFrame, figures_dir: Path) -
         if low_col in comp and high_col in comp:
             low = comp[low_col].to_numpy()
             high = comp[high_col].to_numpy()
-            yerr = np.vstack([values - low, high - values])
+            # A percentile interval need not contain the point estimate (few replicates), and matplotlib
+            # rejects negative error bars, so clip at zero instead of crashing the whole run.
+            yerr = np.clip(np.vstack([values - low, high - values]), 0.0, None)
         fig, ax = plt.subplots(figsize=(max(8, 0.75 * len(comp)), 5.5))
         ax.bar(np.arange(len(comp)), values, yerr=yerr, capsize=3)
         ax.set_xticks(np.arange(len(comp)), plot_labels, rotation=45, ha="right")
@@ -2075,6 +2079,182 @@ def pairwise_bootstrap_comparisons(
 
 
 # -----------------------------------------------------------------------------
+# Area weighting, independent hold-out, and rejection
+# -----------------------------------------------------------------------------
+
+
+def load_class_prevalence(path: Path, class_names: Sequence[str]) -> np.ndarray:
+    """Read ``class,area`` (or ``class,proportion``) and align it with ``class_names``.
+
+    Values only need to be proportional; they describe how much of the *scene* each
+    reference class covers, which the class-capped training sample cannot tell.
+    """
+    df = pd.read_csv(path)
+    lower = {c.lower(): c for c in df.columns}
+    value_col = next((lower[k] for k in ("area", "proportion", "weight", "fraction") if k in lower), None)
+    if "class" not in lower or value_col is None:
+        raise ValueError("Class-prevalence CSV needs columns: class and one of area/proportion/weight/fraction.")
+    table = {str(k).casefold(): float(v) for k, v in zip(df[lower["class"]], df[value_col])}
+    missing = [n for n in class_names if n.casefold() not in table]
+    if missing:
+        raise ValueError(f"Class-prevalence CSV has no value for classes: {missing}")
+    values = np.asarray([table[n.casefold()] for n in class_names], dtype=float)
+    if np.any(values < 0) or values.sum() <= 0:
+        raise ValueError("Class-prevalence values must be non-negative with a positive sum.")
+    return values / values.sum()
+
+
+def area_weighted_metrics(
+    confusion: np.ndarray,
+    prevalence: np.ndarray,
+    class_names: Sequence[str],
+) -> tuple[dict[str, float], pd.DataFrame]:
+    """Re-weight a confusion matrix (rows = reference) to scene class proportions.
+
+    The training sample is capped per reference class, so it over-represents rare classes.
+    For a sample stratified by reference class, the estimated area proportion in cell (i, j)
+    is ``W_i * n_ij / n_i`` (W_i = share of the scene that is class i). Overall accuracy,
+    user's/producer's accuracy, F1 and kappa follow from those proportions.
+    """
+    cm = np.asarray(confusion, dtype=float)
+    w = np.asarray(prevalence, dtype=float)
+    n_i = cm.sum(axis=1, keepdims=True)
+    p = np.divide(w[:, None] * cm, n_i, out=np.zeros_like(cm), where=n_i > 0)
+    diag = np.diag(p)
+    row, col = p.sum(axis=1), p.sum(axis=0)
+    pa = np.divide(diag, row, out=np.zeros_like(diag), where=row > 0)
+    ua = np.divide(diag, col, out=np.zeros_like(diag), where=col > 0)
+    denom = ua + pa
+    f1 = np.divide(2 * ua * pa, denom, out=np.zeros_like(diag), where=denom > 0)
+    oa = float(diag.sum())
+    chance = float(np.sum(row * col))
+    kappa = (oa - chance) / (1.0 - chance) if chance < 1.0 else float("nan")
+    summary = {
+        "OA_area_weighted": oa,
+        "macro_F1_area_weighted": float(f1.mean()),
+        "kappa_area_weighted": float(kappa),
+    }
+    per_class = pd.DataFrame(
+        {
+            "class_name": list(class_names),
+            "scene_proportion": w,
+            "precision_UA_area_weighted": ua,
+            "recall_PA_area_weighted": pa,
+            "F1_area_weighted": f1,
+        }
+    )
+    return summary, per_class
+
+
+def split_holdout_groups(
+    y: np.ndarray,
+    groups: np.ndarray,
+    fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reserve whole spatial groups, stratified by class, as an independent test set.
+
+    Returns ``(dev_idx, holdout_idx)``. Every class must keep at least two groups for
+    development (so grouped CV still works) and have at least one hold-out group.
+    """
+    if not 0.0 < fraction < 0.5:
+        raise ValueError("holdout_fraction must be between 0 and 0.5 (exclusive).")
+    n_splits = max(2, int(round(1.0 / fraction)))
+    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed + 555)
+    dev_idx, hold_idx = next(iter(splitter.split(np.zeros(len(y)), y, groups)))
+    problems = []
+    for c in np.unique(y):
+        n_dev = np.unique(groups[dev_idx][y[dev_idx] == c]).size
+        n_hold = np.unique(groups[hold_idx][y[hold_idx] == c]).size
+        if n_dev < 2 or n_hold < 1:
+            problems.append(f"class id {int(c)}: {n_dev} development / {n_hold} hold-out groups")
+    if problems:
+        raise RuntimeError(
+            "holdout_fraction leaves a class without enough independent groups ("
+            + "; ".join(problems)
+            + "). Use a smaller fraction, more training regions, or disable the hold-out."
+        )
+    return dev_idx, hold_idx
+
+
+def evaluate_holdout(
+    model_name: str,
+    X_dev: np.ndarray,
+    y_dev: np.ndarray,
+    groups_dev: np.ndarray,
+    coords_dev: np.ndarray,
+    X_hold: np.ndarray,
+    y_hold: np.ndarray,
+    groups_hold: np.ndarray,
+    coords_hold: np.ndarray,
+    class_names: Sequence[str],
+    feature_context: FeatureContext,
+    inner_folds: int,
+    n_jobs: int,
+    seed: int,
+    svm_cap: int,
+    knn_cap: int,
+    buffer_px: float,
+    bootstrap_reps: int,
+) -> tuple[dict[str, Any], pd.DataFrame, np.ndarray]:
+    """Fit on all development pixels and score once on the reserved hold-out groups.
+
+    Development pixels within ``buffer_px`` of a hold-out pixel are excluded from the fit.
+    """
+    labels = np.arange(len(class_names), dtype=np.int32)
+    n_dev = len(y_dev)
+    all_coords = np.vstack([coords_dev, coords_hold])
+    train_idx, min_dist, n_dropped = buffer_train_indices(
+        np.arange(n_dev), n_dev + np.arange(len(y_hold)), all_coords, buffer_px
+    )
+    model, params, n_fit = fit_with_grouped_tuning(
+        model_name=model_name,
+        X=X_dev,
+        y=y_dev,
+        groups=groups_dev,
+        train_idx=train_idx,
+        n_features=X_dev.shape[1],
+        spectral_cols=feature_context.base_feature_count,
+        inner_folds=inner_folds,
+        n_jobs=n_jobs,
+        seed=seed + 7777,
+        svm_cap=svm_cap,
+        knn_cap=knn_cap,
+        coords=coords_dev,
+        buffer_px=buffer_px,
+    )
+    pred = np.asarray(model.predict(X_hold), dtype=y_hold.dtype)
+    record: dict[str, Any] = {
+        "model": model_name,
+        "feature_set": feature_context.spec.name,
+        "n_holdout": int(len(y_hold)),
+        "n_holdout_groups": int(np.unique(groups_hold).size),
+        "n_fit": int(n_fit),
+        "min_train_holdout_dist_px": min_dist,
+        "n_train_dropped_by_buffer": n_dropped,
+        "best_params": json.dumps(params, default=str),
+        **metric_summary(y_hold, pred, labels),
+    }
+    for key, (lo, hi) in bootstrap_metric_ci(y_hold, pred, groups_hold, labels, bootstrap_reps, seed + 9999).items():
+        record[f"{key}_CI95_low"] = lo
+        record[f"{key}_CI95_high"] = hi
+    cm = confusion_matrix(y_hold, pred, labels=labels)
+    return record, per_class_table(y_hold, pred, class_names), cm
+
+
+def apply_rejection(
+    codes: np.ndarray,
+    confidence: np.ndarray,
+    min_confidence: float,
+    reject_code: int,
+) -> np.ndarray:
+    """Replace class codes by ``reject_code`` where confidence is below the threshold."""
+    if min_confidence <= 0:
+        return codes
+    return np.where(confidence < min_confidence, reject_code, codes)
+
+
+# -----------------------------------------------------------------------------
 # Final fit, confidence, and tile-based mapping
 # -----------------------------------------------------------------------------
 
@@ -2151,6 +2331,7 @@ def map_full_raster(
     tile_size: int,
     write_confidence: bool,
     index_tolerance_nm: float,
+    min_confidence: float = 0.0,
 ) -> tuple[Path, Path | None]:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"classification_{sanitize_name(feature_context.spec.name)}_{sanitize_name(model_name)}"
@@ -2158,7 +2339,10 @@ def map_full_raster(
     conf_path = output_dir / f"confidence_{sanitize_name(feature_context.spec.name)}_{sanitize_name(model_name)}.tif"
 
     with rasterio.open(image_path) as src:
-        dtype = "uint8" if len(class_names) < 255 else "uint16"
+        # One extra code (len+1) is reserved for "Unclassified" when a rejection threshold is used.
+        dtype = "uint8" if len(class_names) < 254 else "uint16"
+        reject_code = len(class_names) + 1
+        need_confidence = write_confidence or min_confidence > 0
         profile = src.profile.copy()
         # GeoTIFF internal tiles must be a multiple of 16 pixels.
         block = max(16, (min(512, tile_size) // 16) * 16)
@@ -2203,10 +2387,13 @@ def map_full_raster(
                             index_tolerance_nm,
                         )
                         pred = np.asarray(model.predict(X_tile), dtype=int)
-                        out_class[valid] = (pred + 1).astype(dtype)
-                        if write_confidence:
+                        codes = pred + 1
+                        if need_confidence:
                             conf, conf_type = confidence_from_model(model, X_tile)
-                            out_conf[valid] = conf
+                            if write_confidence:
+                                out_conf[valid] = conf
+                            codes = apply_rejection(codes, conf, min_confidence, reject_code)
+                        out_class[valid] = codes.astype(dtype)
 
                     dst_class.write(out_class.reshape(h, w), 1, window=window)
                     if dst_conf_ctx is not None:
@@ -2220,6 +2407,8 @@ def map_full_raster(
                     FEATURE_SET=feature_context.spec.name,
                     MODEL=model_name,
                     SPECTRAL_BENCHMARK_VERSION=VERSION,
+                    MIN_CONFIDENCE=str(min_confidence),
+                    UNCLASSIFIED_CODE=str(reject_code) if min_confidence > 0 else "none",
                 )
                 if dst_conf_ctx is not None:
                     dst_conf_ctx.update_tags(
@@ -2232,7 +2421,7 @@ def map_full_raster(
                     dst_conf_ctx.close()
 
     legend_path = output_dir / "legend.csv"
-    if not legend_path.exists():
+    if min_confidence > 0 or not legend_path.exists():
         pd.DataFrame(
             [
                 {"code": 0, "class_name": "NoData", "r": 0, "g": 0, "b": 0},
@@ -2246,6 +2435,11 @@ def map_full_raster(
                     }
                     for i, name in enumerate(class_names)
                 ],
+                *(
+                    [{"code": reject_code, "class_name": "Unclassified", "r": 128, "g": 128, "b": 128}]
+                    if min_confidence > 0
+                    else []
+                ),
             ]
         ).to_csv(legend_path, index=False)
 
@@ -2265,9 +2459,10 @@ def save_classification_preview(
         out_h = max(1, int(round(ds.height / scale)))
         arr = ds.read(1, out_shape=(out_h, out_w), resampling=Resampling.nearest)
 
-    lut = np.zeros((len(class_names) + 1, 3), dtype=np.uint8)
+    lut = np.zeros((len(class_names) + 2, 3), dtype=np.uint8)
+    lut[len(class_names) + 1] = (128, 128, 128)  # "Unclassified" when a rejection threshold was used
     for i, rgb in enumerate(colors, start=1):
-        if i < len(lut):
+        if i <= len(class_names):
             lut[i] = rgb
     clipped = np.clip(arr.astype(int), 0, len(lut) - 1)
     rgb = lut[clipped]
@@ -2360,6 +2555,11 @@ def run(args: argparse.Namespace) -> int:
     buffer_px = float(config_value(args.buffer_px, config, "buffer_px", 0.0))
     repeats = int(config_value(args.repeats, config, "repeats", 1))
     group_merge_px = float(config_value(args.group_merge_px, config, "group_merge_px", 0.0))
+    class_prevalence_path = config_value(args.class_prevalence, config, "class_prevalence")
+    holdout_fraction = float(config_value(args.holdout_fraction, config, "holdout_fraction", 0.0))
+    min_confidence = float(config_value(args.min_confidence, config, "min_confidence", 0.0))
+    if not 0.0 <= min_confidence < 1.0:
+        raise ValueError("min_confidence must be in [0, 1).")
     if buffer_px < 0 or group_merge_px < 0 or repeats < 1:
         raise ValueError("buffer_px and group_merge_px must be >= 0 and repeats must be >= 1.")
 
@@ -2503,6 +2703,28 @@ def run(args: argparse.Namespace) -> int:
 
         coords = np.column_stack([rows, cols]).astype(np.float64)
 
+        prevalence = (
+            load_class_prevalence(Path(class_prevalence_path), labels.class_names)
+            if class_prevalence_path
+            else None
+        )
+
+        split = np.full(len(y), "development", dtype=object)
+        hold_data: dict[str, np.ndarray] | None = None
+        if holdout_fraction > 0:
+            dev_idx, hold_idx = split_holdout_groups(y, groups, holdout_fraction, seed)
+            split[hold_idx] = "holdout"
+            hold_data = {
+                "raw": raw_spectra[hold_idx],
+                "y": y[hold_idx],
+                "groups": groups[hold_idx],
+                "coords": coords[hold_idx],
+            }
+            log(
+                f"Hold-out: {len(hold_idx):,} pixels in {np.unique(groups[hold_idx]).size} groups reserved "
+                f"for one final evaluation; {len(dev_idx):,} pixels used for development."
+            )
+
         sample_manifest = pd.DataFrame(
             {
                 "row": rows,
@@ -2510,9 +2732,24 @@ def run(args: argparse.Namespace) -> int:
                 "class_id": y,
                 "class_name": [labels.class_names[c] for c in y],
                 "group": groups,
+                "split": split,
             }
         )
         sample_manifest.to_csv(tables_dir / "training_sample_manifest.csv", index=False)
+
+        if hold_data is not None:
+            # Everything below (band statistics, model selection, CV) sees development pixels only.
+            rows, cols, y, groups, raw_spectra, coords = (
+                a[dev_idx] for a in (rows, cols, y, groups, raw_spectra, coords)
+            )
+
+        gpc = groups_per_class(y, groups)
+        if min(gpc.values()) < 8:
+            warnings.warn(
+                f"Some classes have fewer than 8 independent groups (groups per class: {gpc}). Bootstrap "
+                f"confidence intervals and fold-to-fold estimates are unreliable at this size; treat the "
+                f"results as indicative and add independent training regions if possible."
+            )
 
         global_sample = sample_global_raster_pixels(ds, global_band_samples, seed + 81)
         band_diag = band_diagnostics(
@@ -2524,6 +2761,8 @@ def run(args: argparse.Namespace) -> int:
             ds.dtypes[0],
         )
         band_diag.to_csv(tables_dir / "band_diagnostics.csv", index=False)
+        log("Note: band_diagnostics.csv is screening information only. Dropping bands based on it and then "
+            "cross-validating on the same pixels leaks label information (see docs/METHODOLOGY.md).")
         save_band_diagnostics_figure(band_diag, figures_dir / "band_diagnostics.png")
 
         class_stats = class_spectral_statistics(
@@ -2650,6 +2889,7 @@ def run(args: argparse.Namespace) -> int:
         raise RuntimeError("No classifier completed successfully.")
 
     comparison_rows: list[dict[str, Any]] = []
+    area_weighted_rows: list[pd.DataFrame] = []
     all_fold_rows: list[dict[str, Any]] = []
     all_per_class_rows: list[pd.DataFrame] = []
     for result in validation_results:
@@ -2661,7 +2901,14 @@ def run(args: argparse.Namespace) -> int:
             "n_features_total": len(context.feature_names),
             "n_spectral_features": context.base_feature_count,
             **result.summary,
+            **(area_weighted_metrics(result.confusion, prevalence, labels.class_names)[0] if prevalence is not None else {}),
         })
+        if prevalence is not None:
+            area_weighted_rows.append(
+                area_weighted_metrics(result.confusion, prevalence, labels.class_names)[1].assign(
+                    feature_set=result.feature_set, model=result.model
+                )
+            )
         for rec in result.fold_metrics:
             all_fold_rows.append({"feature_set": result.feature_set, "model": result.model, **rec})
         all_per_class_rows.append(result.per_class.assign(feature_set=result.feature_set, model=result.model))
@@ -2670,6 +2917,10 @@ def run(args: argparse.Namespace) -> int:
         ["macro_F1", "OA"], ascending=[False, False]
     )
     comparison.to_csv(tables_dir / "model_comparison.csv", index=False)
+    if area_weighted_rows:
+        pd.concat(area_weighted_rows, ignore_index=True).to_csv(
+            tables_dir / "area_weighted_per_class_metrics.csv", index=False
+        )
     pd.DataFrame(all_fold_rows).to_csv(tables_dir / "all_fold_metrics.csv", index=False)
     per_class_all = pd.concat(all_per_class_rows, ignore_index=True)
     per_class_all.to_csv(tables_dir / "all_per_class_metrics.csv", index=False)
@@ -2689,6 +2940,32 @@ def run(args: argparse.Namespace) -> int:
         f"\nBest validation result: feature_set={best['feature_set']}, model={best['model']}, "
         f"macro-F1={best['macro_F1']:.3f}, OA={best['OA']:.3f}"
     )
+
+    holdout_summary: dict[str, Any] | None = None
+    if hold_data is not None:
+        X_dev_best, ctx_best = feature_cache[str(best["feature_set"])]
+        X_hold_best, _ = build_features(
+            hold_data["raw"], selected_band_indices, band_names, wavelengths_nm, ctx_best.spec, index_tolerance_nm
+        )
+        log(f"\nEvaluating the selected combination once on the hold-out groups: "
+            f"{best['feature_set']} | {best['model']}")
+        record, hold_per_class, hold_cm = evaluate_holdout(
+            str(best["model"]), X_dev_best, y, groups, coords,
+            X_hold_best, hold_data["y"], hold_data["groups"], hold_data["coords"],
+            labels.class_names, ctx_best, inner_folds, n_jobs, seed, svm_cap, knn_cap, buffer_px, bootstrap_reps,
+        )
+        record["development_cv_macro_F1"] = float(best["macro_F1"])
+        record["development_cv_OA"] = float(best["OA"])
+        pd.DataFrame([record]).to_csv(tables_dir / "holdout_result.csv", index=False)
+        hold_per_class.to_csv(tables_dir / "holdout_per_class_metrics.csv", index=False)
+        pd.DataFrame(hold_cm, index=labels.class_names, columns=labels.class_names).to_csv(
+            tables_dir / "holdout_confusion_counts.csv"
+        )
+        holdout_summary = record
+        log(
+            f"  hold-out macro-F1={record['macro_F1']:.3f} (development CV: {best['macro_F1']:.3f}), "
+            f"OA={record['OA']:.3f} (development CV: {best['OA']:.3f})"
+        )
 
     # Optional final maps.
     map_requests = parse_csv_list(args.map) if args.map is not None else [str(x) for x in config.get("map", [])]
@@ -2713,20 +2990,36 @@ def run(args: argparse.Namespace) -> int:
         if model_name not in models:
             raise ValueError(f"Map model {model_name!r} was not evaluated.")
 
+        if min_confidence > 0 and model_name in {"SAM", "SID", "MIN_DIST", "MAHALANOBIS", "SVM"}:
+            warnings.warn(
+                f"--min-confidence with {model_name}: its confidence is a relative softmax of distances / "
+                f"decision values, not a probability, so a fixed threshold can reject most pixels. Prefer "
+                f"RF, HGB, LDA, QDA or KNN for rejection, and inspect the confidence raster first."
+            )
         X, context = feature_cache[feature_name]
+        y_map, groups_map, coords_map = y, groups, coords
+        if hold_data is not None:
+            # Evaluation is finished, so the deployed map model uses every labelled pixel.
+            X_hold_map, _ = build_features(
+                hold_data["raw"], selected_band_indices, band_names, wavelengths_nm, context.spec, index_tolerance_nm
+            )
+            X = np.vstack([X, X_hold_map])
+            y_map = np.concatenate([y, hold_data["y"]])
+            groups_map = np.concatenate([groups, hold_data["groups"]])
+            coords_map = np.vstack([coords, hold_data["coords"]])
         log(f"\nFitting final model for map: {feature_name} | {model_name}")
         final_model, final_params, n_fit = fit_final_model(
             model_name,
             X,
-            y,
-            groups,
+            y_map,
+            groups_map,
             context,
             inner_folds,
             n_jobs,
             seed,
             svm_cap,
             knn_cap,
-            coords=coords,
+            coords=coords_map,
             buffer_px=buffer_px,
         )
         write_confidence = bool(args.write_confidence or config.get("write_confidence", False))
@@ -2744,6 +3037,7 @@ def run(args: argparse.Namespace) -> int:
             tile_size,
             write_confidence,
             index_tolerance_nm,
+            min_confidence=min_confidence,
         )
         preview_path = figures_dir / f"preview_{sanitize_name(feature_name)}_{sanitize_name(model_name)}.png"
         save_classification_preview(class_path, labels.colors, labels.class_names, preview_path)
@@ -2778,6 +3072,10 @@ def run(args: argparse.Namespace) -> int:
         "buffer_px": buffer_px,
         "repeats": repeats,
         "group_merge_px": group_merge_px,
+        "holdout_fraction": holdout_fraction,
+        "class_prevalence": str(class_prevalence_path) if class_prevalence_path else None,
+        "min_confidence": min_confidence,
+        "holdout_result": holdout_summary,
         "n_groups": int(np.unique(groups).size),
         "seed": seed,
         "n_jobs": n_jobs,
@@ -2822,6 +3120,16 @@ def run(args: argparse.Namespace) -> int:
         "  figures/class_spectral_signatures.png",
         "  figures/band_diagnostics.png",
         "",
+        *(
+            [
+                "Independent hold-out (scored once, after model selection)",
+                f"  Macro-F1: {holdout_summary['macro_F1']:.4f}   OA: {holdout_summary['OA']:.4f}",
+                "  See tables/holdout_result.csv",
+                "",
+            ]
+            if holdout_summary
+            else []
+        ),
         "Interpretation note",
         "  Band diagnostics are conservative screening aids, not automatic scientific exclusion rules.",
         "  Final band removal should be justified with validation performance and domain knowledge.",
@@ -2904,6 +3212,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repeat the outer grouped CV with different fold assignments and average (1 = single run).",
     )
 
+    validation.add_argument(
+        "--holdout-fraction",
+        type=float,
+        default=None,
+        help="Reserve this fraction of spatial groups (0-0.5) as an independent test set, scored once for the "
+        "best development combination. 0 = off.",
+    )
+    validation.add_argument(
+        "--class-prevalence",
+        help="CSV with columns class,area (or proportion): scene share of each reference class. Adds "
+        "area-weighted OA / F1 / kappa.",
+    )
+
     diagnostics = p.add_argument_group("Diagnostics")
     diagnostics.add_argument("--band-analysis-samples", type=int, default=None, help="Approximate global raster pixels sampled for band diagnostics.")
 
@@ -2914,6 +3235,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mapping.add_argument("--map-top", type=int, default=None, help="Also map the top N validation combinations.")
     mapping.add_argument("--tile-size", type=int, default=None)
+    mapping.add_argument(
+        "--min-confidence",
+        type=float,
+        default=None,
+        help="Map pixels whose confidence is below this value to an 'Unclassified' code. Confidence is only "
+        "meaningful for models with predict_proba (RF, HGB, LDA, QDA, KNN); 0 = off.",
+    )
     mapping.add_argument("--write-confidence", action="store_true", help="Write float32 confidence raster(s); can be very large.")
 
     return p

@@ -74,7 +74,7 @@ def make_data(root: Path) -> tuple[Path, Path]:
     return image, xml_path
 
 
-def run_pipeline(root: Path) -> Path:
+def run_pipeline(root: Path, extra: list[str] | None = None) -> Path:
     script = Path(__file__).resolve().parents[1] / "spectral_benchmark.py"
     image, xml_path = make_data(root)
     out = root / "results"
@@ -100,7 +100,8 @@ def run_pipeline(root: Path) -> Path:
         # 50 is deliberately not a multiple of 16: GeoTIFF block sizes must be.
         "--tile-size", "50",
     ]
-    subprocess.run(cmd, check=True)
+    # Later occurrences override earlier ones in argparse, so ``extra`` can change any option.
+    subprocess.run(cmd + (extra or []), check=True)
     return out
 
 
@@ -125,6 +126,40 @@ def check_outputs(out: Path) -> None:
 
 def test_end_to_end(tmp_path: Path) -> None:
     check_outputs(run_pipeline(tmp_path))
+
+
+def test_end_to_end_with_spatial_options(tmp_path: Path) -> None:
+    """Hold-out, spatial buffer, repeats, area weighting and rejection run together."""
+    prev = tmp_path / "prevalence.csv"
+    prev.write_text("class,area\nA,700\nB,200\nC,100\n", encoding="utf-8")
+    out = run_pipeline(
+        tmp_path,
+        [
+            "--models", "LDA,SAM",
+            "--feature-sets", "raw",
+            "--buffer-px", "3",
+            "--group-merge-px", "4",
+            "--repeats", "2",
+            "--holdout-fraction", "0.34",
+            "--class-prevalence", str(prev),
+            "--map", "raw:LDA",
+            "--min-confidence", "0.5",
+        ],
+    )
+    import pandas as pd
+
+    tables = out / "tables"
+    assert (tables / "holdout_result.csv").exists()
+    assert (tables / "area_weighted_per_class_metrics.csv").exists()
+    comparison = pd.read_csv(tables / "model_comparison.csv")
+    assert {"OA_area_weighted", "min_train_test_dist_px", "min_groups_per_class"} <= set(comparison.columns)
+    assert (comparison["n_repeats"] == 2).all()
+    split = pd.read_csv(tables / "training_sample_manifest.csv")["split"]
+    assert set(split) == {"development", "holdout"}
+    legend = pd.read_csv(out / "maps" / "legend.csv")
+    assert legend["class_name"].iloc[-1] == "Unclassified"
+    manifest = json.loads((out / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["holdout_result"] is not None and manifest["holdout_fraction"] == 0.34
 
 
 def main() -> int:

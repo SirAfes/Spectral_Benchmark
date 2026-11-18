@@ -48,19 +48,49 @@ feature set. Comparing 10 models gives 45 pairs; unadjusted intervals will show 
 `_p_holm` columns for claims of superiority. The bootstrap p-value is approximate and limited by the number of
 replicates (resolution about 2/(B+1); use `--pairwise-bootstrap 1000` or more for publication).
 
-## 5. Biases that remain (and are not fixable in software)
+## 5. Independent hold-out (honest final score)
+
+`--holdout-fraction F` (for example 0.3) reserves whole spatial groups, stratified by class, **before** anything else
+happens: band diagnostics, model selection and cross-validation only ever see the development groups. After the
+best development combination is chosen, it is refit on all development pixels (excluding any within `--buffer-px` of a
+hold-out pixel) and scored **once** on the hold-out groups (`tables/holdout_result.csv`, with group-bootstrap
+intervals and the development-CV score next to it). A hold-out score noticeably below the development score is the
+winner's curse made visible. Maps are then fitted on all labelled pixels, since evaluation is finished.
+
+It needs enough groups: every class must keep at least two development groups and have one hold-out group, otherwise
+the run stops with an explanation. With very few groups, prefer `--repeats` and report the uncertainty.
+
+## 6. Scene-level (area-weighted) metrics
+
+Training samples are capped per class, so OA on them is not the accuracy of the map. If you know how much of the scene each
+reference class covers, pass `--class-prevalence prevalence.csv` (`class,area`). The confusion matrix is re-weighted
+(`p_ij = W_i * n_ij / n_i`) and `OA_area_weighted`, `macro_F1_area_weighted`, `kappa_area_weighted` and per-class
+user's/producer's accuracy (`area_weighted_per_class_metrics.csv`) are reported. This corrects the class mix; it does not
+correct ROI selection bias (see below). Class areas must come from an independent source (for example a stratified
+reference survey), not from the ROIs.
+
+## 7. Rejecting uncertain pixels in maps
+
+`--min-confidence P` writes pixels whose confidence is below P as an extra `Unclassified` code (listed in `legend.csv`).
+This is only meaningful for models with real class probabilities (RF, HGB, LDA, QDA, KNN). For SAM, SID, MIN_DIST,
+MAHALANOBIS and SVM the confidence is a relative score, and a fixed threshold can reject most of the scene; the run warns.
+Inspect a confidence raster (`--write-confidence`) before choosing a threshold, and treat the threshold as a
+cartographic choice, not a validated accuracy guarantee.
+
+## 8. Biases that remain (and are not fixable in software)
 
 - **Winner's curse / selection on the same data.** Picking the best of many model x feature-set combinations on the
-  same OOF predictions makes the best score optimistic. Fix the protocol before looking, or confirm on independent areas.
-- **Band and feature selection.** `band_diagnostics.csv` (Fisher scores etc.) uses all training pixels. Dropping bands based on it
-  and then cross-validating on the same pixels leaks label information. Choose bands from physical reasoning or
-  select them inside the CV folds.
+  same OOF predictions makes the best score optimistic. Use `--holdout-fraction` (section 5) or confirm on independent areas.
+- **Band and feature selection.** `band_diagnostics.csv` (Fisher scores etc.) uses all development pixels. Dropping bands based on it
+  and then cross-validating on the same pixels leaks label information. Choose bands from physical reasoning, or use
+  `--holdout-fraction` so the final score is computed on groups that never influenced the choice. (Selecting bands
+  inside each CV fold is not implemented.)
 - **ROI selection bias.** ROIs are drawn on clear, homogeneous patches; accuracy on them overstates accuracy on mixed or
   transitional pixels and on classes that were not digitised.
 - **Class-balanced sampling.** Overall Accuracy is computed on a capped, roughly balanced sample, not on the scene's true class proportions.
-  Prefer Macro-F1 / per-class metrics, or area-weight the confusion matrix before quoting an area-based OA.
+  Use `--class-prevalence` (section 6) before quoting a scene-level OA, or prefer Macro-F1 / per-class metrics.
 - **Interval coverage.** Group-bootstrap intervals reflect sampling variability of the *test groups*; they do not capture
-  variability from re-training on different groups, and they are unreliable with fewer than ~8-10 groups per class.
+  variability from re-training on different groups, and they are unreliable with fewer than ~8-10 groups per class (the run warns below 8).
 
 ## 6. Model-specific notes
 
@@ -69,5 +99,5 @@ replicates (resolution about 2/(B+1); use `--pairwise-bootstrap 1000` or more fo
 - SAM and SID use only the spectral part of a feature set (no indices/derivatives).
 - Confidence values from distance-based models are a softmax of distances with a scale fixed at fit time. They rank
   pixels within one map but are **not** probabilities.
-- Every pixel in a map is forced into one of the trained classes. Water, shadow, unvisited habitats and mixed pixels are
-  therefore misclassified silently. Consider adding an explicit "other" class or masking such areas upstream.
+- Every pixel in a map is forced into one of the trained classes unless `--min-confidence` is used (section 7). Water, shadow,
+  unvisited habitats and mixed pixels are otherwise misclassified silently. Consider an explicit "other" class or masking such areas upstream.

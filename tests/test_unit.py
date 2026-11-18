@@ -534,3 +534,122 @@ def test_spatial_buffer_removes_neighbour_leakage():
     unbuffered, buffered = float(np.mean(acc[0])), float(np.mean(acc[9]))
     assert unbuffered - buffered > 0.04, (unbuffered, buffered)
     assert buffered < 0.70  # close to the true ceiling, not inflated
+
+
+# --------------------------------------------------------------------------- area weighting
+
+
+def test_area_weighted_metrics_hand_computed():
+    cm = np.array([[90, 10], [20, 80]])
+    summary, table = sb.area_weighted_metrics(cm, np.array([0.9, 0.1]), ["A", "B"])
+    # p = [[0.81, 0.09], [0.02, 0.08]] -> OA 0.89; PA = [0.9, 0.8]; UA = [0.81/0.83, 0.08/0.17]
+    assert summary["OA_area_weighted"] == pytest.approx(0.89)
+    assert table["recall_PA_area_weighted"].tolist() == pytest.approx([0.9, 0.8])
+    assert table["precision_UA_area_weighted"].tolist() == pytest.approx([0.81 / 0.83, 0.08 / 0.17])
+    chance = 0.9 * 0.83 + 0.1 * 0.17
+    assert summary["kappa_area_weighted"] == pytest.approx((0.89 - chance) / (1 - chance))
+
+
+def test_area_weighting_with_sample_proportions_reproduces_plain_metrics():
+    cm = np.array([[50, 5, 0], [10, 30, 10], [0, 5, 40]])
+    prev = cm.sum(axis=1) / cm.sum()
+    summary, _ = sb.area_weighted_metrics(cm, prev, ["A", "B", "C"])
+    assert summary["OA_area_weighted"] == pytest.approx(np.trace(cm) / cm.sum())
+
+
+def test_rare_class_errors_matter_less_when_class_is_rare_in_the_scene():
+    cm = np.array([[100, 0], [50, 50]])  # class B is poorly recognised (PA 0.5)
+    common_b, _ = sb.area_weighted_metrics(cm, np.array([0.5, 0.5]), ["A", "B"])
+    rare_b, _ = sb.area_weighted_metrics(cm, np.array([0.99, 0.01]), ["A", "B"])
+    assert rare_b["OA_area_weighted"] > common_b["OA_area_weighted"]
+
+
+def test_load_class_prevalence(tmp_path):
+    f = tmp_path / "prev.csv"
+    f.write_text("class,area\nsand,600\nKELP,200\nextra,5\n")
+    out = sb.load_class_prevalence(f, ["Sand", "Kelp"])
+    assert out.tolist() == pytest.approx([0.75, 0.25])
+    with pytest.raises(ValueError, match="no value"):
+        sb.load_class_prevalence(f, ["Sand", "Rock"])
+    bad = tmp_path / "bad.csv"
+    bad.write_text("name,count\nA,1\n")
+    with pytest.raises(ValueError):
+        sb.load_class_prevalence(bad, ["A"])
+
+
+# --------------------------------------------------------------------------- hold-out
+
+
+def test_split_holdout_groups_is_group_disjoint_and_class_complete():
+    _, y, groups = _grouped_problem()
+    dev, hold = sb.split_holdout_groups(y, groups, 0.34, seed=0)
+    assert set(groups[dev]).isdisjoint(set(groups[hold]))
+    assert len(dev) + len(hold) == len(y)
+    for c in np.unique(y):
+        assert np.unique(groups[dev][y[dev] == c]).size >= 2
+        assert np.unique(groups[hold][y[hold] == c]).size >= 1
+    with pytest.raises(ValueError):
+        sb.split_holdout_groups(y, groups, 0.0, 0)
+    with pytest.raises(ValueError):
+        sb.split_holdout_groups(y, groups, 0.7, 0)
+
+
+def test_split_holdout_rejects_too_few_groups():
+    y = np.repeat([0, 1], 20)
+    groups = np.repeat([0, 1, 2, 3], 10)  # two groups per class only
+    with pytest.raises(RuntimeError, match="holdout_fraction"):
+        sb.split_holdout_groups(y, groups, 0.34, 0)
+
+
+def test_evaluate_holdout_scores_unseen_groups():
+    X, y, groups = _grouped_problem()
+    coords = np.random.default_rng(3).uniform(0, 200, (len(y), 2))
+    dev, hold = sb.split_holdout_groups(y, groups, 0.34, seed=1)
+    record, per_class, cm = sb.evaluate_holdout(
+        "LDA", X[dev], y[dev], groups[dev], coords[dev], X[hold], y[hold], groups[hold], coords[hold],
+        ["A", "B", "C"], _ctx(), 2, 1, 0, 0, 0, buffer_px=2.0, bootstrap_reps=10,
+    )
+    assert record["n_holdout"] == len(hold) and record["n_holdout_groups"] == np.unique(groups[hold]).size
+    assert record["OA"] > 0.9 and "macro_F1_CI95_low" in record
+    assert record["n_train_dropped_by_buffer"] >= 0 and cm.sum() == len(hold)
+    assert len(per_class) == 3
+
+
+# --------------------------------------------------------------------------- rejection
+
+
+def test_apply_rejection():
+    codes = np.array([1, 2, 3, 2])
+    conf = np.array([0.9, 0.2, 0.6, 0.49])
+    assert sb.apply_rejection(codes, conf, 0.5, 9).tolist() == [1, 9, 3, 9]
+    assert sb.apply_rejection(codes, conf, 0.0, 9) is codes
+
+
+def test_new_config_keys_v13():
+    assert {"class_prevalence", "holdout_fraction", "min_confidence"} <= sb.KNOWN_CONFIG_KEYS
+
+
+def test_model_comparison_reports_group_count():
+    X, y, groups = _grouped_problem()
+    res = sb.evaluate_model(X, y, groups, ["A", "B", "C"], _ctx(), "SAM", 3, 2, 0, 1, 0, 0, 0)
+    assert res.summary["min_groups_per_class"] == 6
+
+
+def test_comparison_figure_survives_interval_that_excludes_the_estimate(tmp_path):
+    """Regression: negative error bars used to crash the whole run at the plotting stage."""
+    import pandas as pd
+
+    comparison = pd.DataFrame(
+        {
+            "feature_set": ["raw", "raw"],
+            "model": ["A", "B"],
+            "macro_F1": [0.90, 0.80],
+            "macro_F1_CI95_low": [0.95, 0.70],  # low > estimate for the first model
+            "macro_F1_CI95_high": [0.99, 0.75],  # high < estimate for the second
+            "OA": [0.9, 0.8],
+            "OA_CI95_low": [0.85, 0.7],
+            "OA_CI95_high": [0.95, 0.9],
+        }
+    )
+    sb.save_model_comparison_figures(comparison, tmp_path)
+    assert (tmp_path / "model_comparison_macro_F1.png").exists()

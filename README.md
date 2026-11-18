@@ -189,6 +189,9 @@ Grouped folds stop a polygon from being split between train and test, but *neigh
 | `--group-merge-px N` (`group_merge_px`) | Merge groups that have pixels within about N px of each other. |
 | `--buffer-px N` (`buffer_px`) | Exclude training pixels within N px of any test pixel, in the outer and inner folds. |
 | `--repeats R` (`repeats`) | Repeat the outer grouped CV with different fold assignments and average. |
+| `--holdout-fraction F` (`holdout_fraction`) | Reserve a fraction of spatial groups; the best development combination is scored once on them (`holdout_result.csv`). |
+| `--class-prevalence FILE` (`class_prevalence`) | CSV `class,area`: adds area-weighted OA / F1 / kappa that reflect the scene's class mix. |
+| `--min-confidence P` (`min_confidence`) | Map only: pixels below confidence P become `Unclassified` (use with RF/HGB/LDA/QDA/KNN). |
 
 Every run reports `min_train_test_dist_px` (smallest train-to-test distance per fold) so you can see whether neighbour leakage is possible. Pairwise model comparisons include Holm-adjusted p-values (`*_p_holm`) because ten models mean 45 comparisons per feature set.
 

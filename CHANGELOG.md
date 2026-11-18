@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.0
+
+### Added
+- `--holdout-fraction`: reserves whole spatial groups before any analysis and scores the selected best combination once on them (`tables/holdout_result.csv`, `holdout_per_class_metrics.csv`, `holdout_confusion_counts.csv`); the `split` column in the sample manifest shows the assignment. Final maps are fitted on all labelled pixels.
+- `--class-prevalence`: area-weighted OA, macro-F1, kappa and per-class UA/PA (`area_weighted_per_class_metrics.csv`).
+- `--min-confidence`: maps can mark low-confidence pixels as `Unclassified` (with a warning for models whose confidence is not a probability).
+- Warning when a class has fewer than 8 independent groups; `min_groups_per_class` in `model_comparison.csv`.
+- Log note that `band_diagnostics.csv` is screening information only.
+- End-to-end test with all spatial options; unit tests for the new functions.
+
+### Fixed
+- The model-comparison figures crashed the whole run when a bootstrap interval did not contain the point estimate (negative error bars; likely with few bootstrap replicates).
+
+
 ## 1.2.0
 
 ### Added

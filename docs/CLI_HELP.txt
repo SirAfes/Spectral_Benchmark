@@ -12,9 +12,13 @@ usage: -c [-h] [--config CONFIG] [--image IMAGE] [--output-dir OUTPUT_DIR]
           [--max-samples-per-class MAX_SAMPLES_PER_CLASS]
           [--group-block-size GROUP_BLOCK_SIZE]
           [--svm-train-cap SVM_TRAIN_CAP] [--knn-train-cap KNN_TRAIN_CAP]
-          [--n-jobs N_JOBS] [--seed SEED]
+          [--n-jobs N_JOBS] [--seed SEED] [--buffer-px BUFFER_PX]
+          [--group-merge-px GROUP_MERGE_PX] [--repeats REPEATS]
+          [--holdout-fraction HOLDOUT_FRACTION]
+          [--class-prevalence CLASS_PREVALENCE]
           [--band-analysis-samples BAND_ANALYSIS_SAMPLES] [--map MAP]
-          [--map-top MAP_TOP] [--tile-size TILE_SIZE] [--write-confidence]
+          [--map-top MAP_TOP] [--tile-size TILE_SIZE]
+          [--min-confidence MIN_CONFIDENCE] [--write-confidence]
 
 Reusable grouped-validation benchmark for multispectral/hyperspectral
 supervised classification.
@@ -90,6 +94,25 @@ Validation:
                         (default: None)
   --n-jobs N_JOBS       Parallel jobs for inner GridSearchCV. (default: None)
   --seed SEED
+  --buffer-px BUFFER_PX
+                        Exclude training pixels closer than this many pixels
+                        to any test pixel (outer and inner folds). 0 = off.
+                        (default: None)
+  --group-merge-px GROUP_MERGE_PX
+                        Merge groups (polygons/blocks) that have pixels within
+                        this many pixels of each other. 0 = off. (default:
+                        None)
+  --repeats REPEATS     Repeat the outer grouped CV with different fold
+                        assignments and average (1 = single run). (default:
+                        None)
+  --holdout-fraction HOLDOUT_FRACTION
+                        Reserve this fraction of spatial groups (0-0.5) as an
+                        independent test set, scored once for the best
+                        development combination. 0 = off. (default: None)
+  --class-prevalence CLASS_PREVALENCE
+                        CSV with columns class,area (or proportion): scene
+                        share of each reference class. Adds area-weighted OA /
+                        F1 / kappa. (default: None)
 
 Diagnostics:
   --band-analysis-samples BAND_ANALYSIS_SAMPLES
@@ -103,5 +126,10 @@ Optional full-raster mapping:
   --map-top MAP_TOP     Also map the top N validation combinations. (default:
                         None)
   --tile-size TILE_SIZE
+  --min-confidence MIN_CONFIDENCE
+                        Map pixels whose confidence is below this value to an
+                        'Unclassified' code. Confidence is only meaningful for
+                        models with predict_proba (RF, HGB, LDA, QDA, KNN); 0
+                        = off. (default: None)
   --write-confidence    Write float32 confidence raster(s); can be very large.
                         (default: False)
