@@ -1911,7 +1911,6 @@ def save_model_comparison_figures(comparison: pd.DataFrame, figures_dir: Path) -
     if comparison.empty:
         return
     figures_dir.mkdir(parents=True, exist_ok=True)
-    labels = [f"{r.feature_set}\n{r.model}" for r in comparison.itertuples()]
 
     for metric, title in (("macro_F1", "Macro-F1"), ("OA", "Overall Accuracy")):
         order = np.argsort(comparison[metric].to_numpy())[::-1]
